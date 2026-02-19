@@ -3,8 +3,9 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    HeartbeatConfig, HttpRequestConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -126,7 +127,7 @@ pub async fn run_wizard() -> Result<Config> {
     let tunnel_config = setup_tunnel()?;
 
     print_step(5, 9, "Tool Mode & Security");
-    let (composio_config, secrets_config) = setup_tool_mode()?;
+    let (composio_config, secrets_config, browser_config, http_request_config) = setup_tool_mode()?;
 
     print_step(6, 9, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
@@ -171,8 +172,8 @@ pub async fn run_wizard() -> Result<Config> {
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
         secrets: secrets_config,
-        browser: BrowserConfig::default(),
-        http_request: crate::config::HttpRequestConfig::default(),
+        browser: browser_config,
+        http_request: http_request_config,
         multimodal: crate::config::MultimodalConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
@@ -2168,7 +2169,12 @@ fn provider_env_var(name: &str) -> &'static str {
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
 
-fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
+fn setup_tool_mode() -> Result<(
+    ComposioConfig,
+    SecretsConfig,
+    BrowserConfig,
+    HttpRequestConfig,
+)> {
     print_bullet("Choose how ZeroClaw connects to external apps.");
     print_bullet("You can always change this later in config.toml.");
     println!();
@@ -2227,6 +2233,76 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         ComposioConfig::default()
     };
 
+    // ── Tool selection ──
+    println!();
+    print_bullet("Choose optional network tools to enable.");
+    print_bullet("Core local tools stay enabled (shell, file_read/file_write, memory_*).");
+
+    let mut browser_config = BrowserConfig::default();
+    let enable_browser = Confirm::new()
+        .with_prompt("  Enable browser tools (browser_open + browser)?")
+        .default(false)
+        .interact()?;
+
+    if enable_browser {
+        browser_config.enabled = true;
+        browser_config.allowed_domains = prompt_allowed_domains_for_tool("browser")?;
+        println!(
+            "  {} browser.allowed_domains = [{}]",
+            style("✓").green().bold(),
+            style(browser_config.allowed_domains.join(", ")).green()
+        );
+
+        let enable_computer_use = Confirm::new()
+            .with_prompt("  Enable browser.computer_use backend?")
+            .default(false)
+            .interact()?;
+
+        if enable_computer_use {
+            browser_config.backend = "computer_use".to_string();
+            println!(
+                "  {} browser.computer_use: {}",
+                style("✓").green().bold(),
+                style("enabled").green()
+            );
+            print_bullet("Uses default sidecar endpoint (http://127.0.0.1:8787/v1/actions).");
+        } else {
+            println!(
+                "  {} browser backend: {}",
+                style("✓").green().bold(),
+                style(browser_config.backend.as_str()).green()
+            );
+        }
+    } else {
+        println!(
+            "  {} browser tools: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+    }
+
+    let mut http_request_config = HttpRequestConfig::default();
+    let enable_http_request = Confirm::new()
+        .with_prompt("  Enable http_request tool for API calls?")
+        .default(false)
+        .interact()?;
+
+    if enable_http_request {
+        http_request_config.enabled = true;
+        http_request_config.allowed_domains = prompt_allowed_domains_for_tool("http_request")?;
+        println!(
+            "  {} http_request.allowed_domains = [{}]",
+            style("✓").green().bold(),
+            style(http_request_config.allowed_domains.join(", ")).green()
+        );
+    } else {
+        println!(
+            "  {} http_request: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+    }
+
     // ── Encrypted secrets ──
     println!();
     print_bullet("ZeroClaw can encrypt API keys stored in config.toml.");
@@ -2253,7 +2329,97 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         );
     }
 
-    Ok((composio_config, secrets_config))
+    Ok((
+        composio_config,
+        secrets_config,
+        browser_config,
+        http_request_config,
+    ))
+}
+
+fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
+    let options = vec![
+        "Restricted allowlist (recommended)",
+        "Allow ANY public domain (*)",
+    ];
+
+    let choice = Select::new()
+        .with_prompt(format!("  {tool_name}: domain access policy"))
+        .items(&options)
+        .default(0)
+        .interact()?;
+
+    if choice == 1 {
+        print_bullet("ANY-domain mode still blocks localhost and private network targets.");
+        return Ok(vec!["*".to_string()]);
+    }
+
+    prompt_domain_list(&format!(
+        "  {tool_name}: allowed domains (comma-separated, e.g. docs.rs, github.com)"
+    ))
+}
+
+fn prompt_domain_list(prompt: &str) -> Result<Vec<String>> {
+    loop {
+        let raw: String = Input::new()
+            .with_prompt(prompt)
+            .allow_empty(true)
+            .interact_text()?;
+
+        let domains = parse_domain_list(&raw);
+        if !domains.is_empty() {
+            return Ok(domains);
+        }
+
+        println!(
+            "  {} {}",
+            style("✗").red().bold(),
+            style("Enter at least one domain, or choose ANY domain.").yellow()
+        );
+    }
+}
+
+fn parse_domain_list(raw: &str) -> Vec<String> {
+    let mut domains: Vec<String> = raw.split(',').filter_map(normalize_domain_entry).collect();
+    domains.sort_unstable();
+    domains.dedup();
+    domains
+}
+
+fn normalize_domain_entry(raw: &str) -> Option<String> {
+    let mut domain = raw.trim().to_lowercase();
+    if domain.is_empty() {
+        return None;
+    }
+
+    if domain == "*" {
+        return Some(domain);
+    }
+
+    if let Some(stripped) = domain.strip_prefix("https://") {
+        domain = stripped.to_string();
+    } else if let Some(stripped) = domain.strip_prefix("http://") {
+        domain = stripped.to_string();
+    }
+
+    if let Some((host, _)) = domain.split_once('/') {
+        domain = host.to_string();
+    }
+
+    domain = domain
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_string();
+
+    if let Some((host, _)) = domain.split_once(':') {
+        domain = host.to_string();
+    }
+
+    if domain.is_empty() || domain.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some(domain)
 }
 
 // ── Step 6: Hardware (Physical World) ───────────────────────────
@@ -4514,6 +4680,38 @@ fn print_summary(config: &Config) {
         }
     );
 
+    println!(
+        "    {} Browser:       {}",
+        style("🌍").cyan(),
+        if config.browser.enabled {
+            let domains = if config.browser.allowed_domains.is_empty() {
+                "(none configured)".to_string()
+            } else {
+                config.browser.allowed_domains.join(", ")
+            };
+            format!("enabled ({}, domains: {})", config.browser.backend, domains)
+        } else {
+            "disabled".to_string()
+        }
+    );
+
+    println!(
+        "    {} HTTP request:  {}",
+        style("🌐").cyan(),
+        if config.http_request.enabled {
+            if config.http_request.allowed_domains.is_empty() {
+                "enabled (domains not configured)".to_string()
+            } else {
+                format!(
+                    "enabled (domains: {})",
+                    config.http_request.allowed_domains.join(", ")
+                )
+            }
+        } else {
+            "disabled".to_string()
+        }
+    );
+
     // Secrets
     println!("    {} Secrets:       configured", style("🔒").cyan());
 
@@ -4671,6 +4869,19 @@ mod tests {
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
         assert!(ctx.communication_style.is_empty());
+    }
+
+    #[test]
+    fn parse_domain_list_normalizes_and_deduplicates_entries() {
+        let parsed =
+            parse_domain_list(" https://Docs.Example.com/path , docs.example.com, example.com ");
+        assert_eq!(parsed, vec!["docs.example.com", "example.com"]);
+    }
+
+    #[test]
+    fn parse_domain_list_preserves_wildcard_entries() {
+        let parsed = parse_domain_list("*,*.example.com");
+        assert_eq!(parsed, vec!["*", "*.example.com"]);
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────
