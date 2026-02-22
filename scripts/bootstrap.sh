@@ -64,6 +64,15 @@ Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
   ZEROCLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
   ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
+  ZEROCLAW_DOCKER_BROWSER_RUNTIME
+                            Browser runtime provisioning mode for --docker: "auto" (prompt), "on", or "off"
+  ZEROCLAW_DOCKER_BROWSER_SIDECAR_IMAGE
+                            Browser WebDriver sidecar image (default: selenium/standalone-chromium:latest)
+  ZEROCLAW_DOCKER_BROWSER_SIDECAR_NAME
+                            Browser WebDriver sidecar container name (default: zeroclaw-browser-webdriver)
+  ZEROCLAW_DOCKER_NETWORK    Docker network for ZeroClaw + sidecars (default: zeroclaw-bootstrap-net)
+  ZEROCLAW_DOCKER_CARGO_FEATURES
+                            Extra Cargo features for Docker builds (comma-separated)
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
@@ -311,6 +320,22 @@ bool_to_word() {
   else
     echo "no"
   fi
+}
+
+string_to_bool() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on)
+      echo "true"
+      ;;
+    0|false|no|off)
+      echo "false"
+      ;;
+    *)
+      echo "invalid"
+      ;;
+  esac
 }
 
 guided_input_stream() {
@@ -624,12 +649,104 @@ ensure_docker_ready() {
   fi
 }
 
+is_zeroclaw_container() {
+  local image="$1"
+  local command="$2"
+  local image_lc command_lc
+
+  image_lc="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
+  command_lc="$(printf '%s' "$command" | tr '[:upper:]' '[:lower:]')"
+
+  [[ "$image_lc" == *"zeroclaw"* || "$command_lc" == *"zeroclaw"* ]]
+}
+
+maybe_stop_running_zeroclaw_containers() {
+  local -a running_ids running_rows
+  local id name image command row
+
+  while IFS=$'\t' read -r id name image command; do
+    if [[ -z "$id" ]]; then
+      continue
+    fi
+    if is_zeroclaw_container "$image" "$command"; then
+      running_ids+=("$id")
+      running_rows+=("$id"$'\t'"$name"$'\t'"$image"$'\t'"$command")
+    fi
+  done < <("$CONTAINER_CLI" ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Command}}')
+
+  if [[ ${#running_ids[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  warn "Detected running ZeroClaw container(s):"
+  for row in "${running_rows[@]}"; do
+    IFS=$'\t' read -r id name image command <<<"$row"
+    echo "  - $name ($id) image=$image cmd=$command"
+  done
+
+  if ! guided_input_stream >/dev/null 2>&1; then
+    warn "Non-interactive mode detected; leaving existing ZeroClaw containers running."
+    return 0
+  fi
+
+  if prompt_yes_no "Stop these running ZeroClaw containers before continuing?" "yes"; then
+    info "Stopping ${#running_ids[@]} ZeroClaw container(s)"
+    "$CONTAINER_CLI" stop "${running_ids[@]}" >/dev/null
+  else
+    warn "Continuing with existing ZeroClaw containers still running."
+  fi
+}
+
+ensure_docker_network() {
+  local network_name="$1"
+  if "$CONTAINER_CLI" network inspect "$network_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  info "Creating Docker network ($network_name)"
+  "$CONTAINER_CLI" network create "$network_name" >/dev/null
+}
+
+ensure_browser_webdriver_sidecar() {
+  local sidecar_name="$1"
+  local sidecar_image="$2"
+  local network_name="$3"
+
+  if "$CONTAINER_CLI" ps --format '{{.Names}}' | grep -Fxq "$sidecar_name"; then
+    info "Browser WebDriver sidecar already running ($sidecar_name)"
+    return 0
+  fi
+
+  if "$CONTAINER_CLI" ps -a --format '{{.Names}}' | grep -Fxq "$sidecar_name"; then
+    info "Starting existing browser WebDriver sidecar ($sidecar_name)"
+    "$CONTAINER_CLI" start "$sidecar_name" >/dev/null
+    return 0
+  fi
+
+  info "Starting browser WebDriver sidecar ($sidecar_name)"
+  "$CONTAINER_CLI" run -d \
+    --name "$sidecar_name" \
+    --network "$network_name" \
+    --shm-size=2g \
+    "$sidecar_image" >/dev/null
+}
+
 run_docker_bootstrap() {
   local docker_image docker_data_dir default_data_dir fallback_image
   local config_mount workspace_mount
+  local docker_build_features docker_browser_runtime_mode docker_browser_runtime_bool
+  local docker_browser_sidecar_name docker_browser_sidecar_image docker_network
+  local container_network_name docker_browser_webdriver_url
   local -a container_run_user_args container_run_namespace_args
+  local -a container_extra_run_args container_extra_env_args docker_build_args
   docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
   fallback_image="ghcr.io/zeroclaw-labs/zeroclaw:latest"
+  docker_build_features="${ZEROCLAW_DOCKER_CARGO_FEATURES:-}"
+  docker_browser_runtime_mode="${ZEROCLAW_DOCKER_BROWSER_RUNTIME:-auto}"
+  docker_browser_sidecar_name="${ZEROCLAW_DOCKER_BROWSER_SIDECAR_NAME:-zeroclaw-browser-webdriver}"
+  docker_browser_sidecar_image="${ZEROCLAW_DOCKER_BROWSER_SIDECAR_IMAGE:-selenium/standalone-chromium:latest}"
+  docker_network="${ZEROCLAW_DOCKER_NETWORK:-zeroclaw-bootstrap-net}"
+  container_network_name=""
+  docker_browser_webdriver_url=""
   if [[ "$TEMP_CLONE" == true ]]; then
     default_data_dir="$HOME/.zeroclaw-docker"
   else
@@ -644,9 +761,57 @@ run_docker_bootstrap() {
     warn "--skip-install has no effect with --docker."
   fi
 
+  maybe_stop_running_zeroclaw_containers
+
+  docker_browser_runtime_bool="false"
+  case "$(printf '%s' "$docker_browser_runtime_mode" | tr '[:upper:]' '[:lower:]')" in
+    ""|auto)
+      if guided_input_stream >/dev/null 2>&1; then
+        echo
+        if prompt_yes_no "Provision browser WebDriver sidecar for Docker bootstrap?" "yes"; then
+          docker_browser_runtime_bool="true"
+        fi
+      fi
+      ;;
+    *)
+      docker_browser_runtime_bool="$(string_to_bool "$docker_browser_runtime_mode")"
+      if [[ "$docker_browser_runtime_bool" == "invalid" ]]; then
+        warn "Invalid ZEROCLAW_DOCKER_BROWSER_RUNTIME='$docker_browser_runtime_mode' (expected auto/on/off). Defaulting to off."
+        docker_browser_runtime_bool="false"
+      fi
+      ;;
+  esac
+
+  if [[ "$docker_browser_runtime_bool" == "true" ]]; then
+    if [[ ",${docker_build_features// /,}," != *,browser-native,* ]]; then
+      if [[ -n "$docker_build_features" ]]; then
+        docker_build_features+=",browser-native"
+      else
+        docker_build_features="browser-native"
+      fi
+    fi
+    ensure_docker_network "$docker_network"
+    ensure_browser_webdriver_sidecar \
+      "$docker_browser_sidecar_name" \
+      "$docker_browser_sidecar_image" \
+      "$docker_network"
+    container_network_name="$docker_network"
+    docker_browser_webdriver_url="http://${docker_browser_sidecar_name}:4444/wd/hub"
+    info "Browser runtime sidecar: $docker_browser_sidecar_name ($docker_browser_webdriver_url)"
+    if [[ "$SKIP_BUILD" == true ]]; then
+      warn "--skip-build enabled: existing image must already include browser-native feature for rust_native backend."
+    fi
+  fi
+
   if [[ "$SKIP_BUILD" == false ]]; then
     info "Building Docker image ($docker_image)"
-    "$CONTAINER_CLI" build --target release -t "$docker_image" "$WORK_DIR"
+    docker_build_args=(build --target release -t "$docker_image")
+    if [[ -n "$docker_build_features" ]]; then
+      info "Docker build features: $docker_build_features"
+      docker_build_args+=(--build-arg "ZEROCLAW_CARGO_FEATURES=$docker_build_features")
+    fi
+    docker_build_args+=("$WORK_DIR")
+    "$CONTAINER_CLI" "${docker_build_args[@]}"
   else
     info "Skipping Docker image build"
     if ! "$CONTAINER_CLI" image inspect "$docker_image" >/dev/null 2>&1; then
@@ -674,6 +839,15 @@ run_docker_bootstrap() {
   else
     container_run_namespace_args=()
     container_run_user_args=(--user "$(id -u):$(id -g)")
+  fi
+
+  container_extra_run_args=()
+  container_extra_env_args=()
+  if [[ -n "$container_network_name" ]]; then
+    container_extra_run_args+=(--network "$container_network_name")
+  fi
+  if [[ -n "$docker_browser_webdriver_url" ]]; then
+    container_extra_env_args+=(-e "ZEROCLAW_DOCKER_WEBDRIVER_URL=$docker_browser_webdriver_url")
   fi
 
   info "Docker data directory: $docker_data_dir"
@@ -711,8 +885,11 @@ MSG
     "$CONTAINER_CLI" run --rm -it \
       "${container_run_namespace_args[@]}" \
       "${container_run_user_args[@]}" \
+      "${container_extra_run_args[@]+${container_extra_run_args[@]}}" \
       -e HOME=/zeroclaw-data \
       -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+      -e ZEROCLAW_DOCKER_BOOTSTRAP=1 \
+      "${container_extra_env_args[@]+${container_extra_env_args[@]}}" \
       -v "$config_mount" \
       -v "$workspace_mount" \
       "$docker_image" \
@@ -720,8 +897,11 @@ MSG
   else
     "$CONTAINER_CLI" run --rm -it \
       "${container_run_user_args[@]}" \
+      "${container_extra_run_args[@]+${container_extra_run_args[@]}}" \
       -e HOME=/zeroclaw-data \
       -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+      -e ZEROCLAW_DOCKER_BOOTSTRAP=1 \
+      "${container_extra_env_args[@]+${container_extra_env_args[@]}}" \
       -v "$config_mount" \
       -v "$workspace_mount" \
       "$docker_image" \

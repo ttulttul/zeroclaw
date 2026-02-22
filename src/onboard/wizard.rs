@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
@@ -2753,6 +2754,31 @@ fn setup_tool_mode() -> Result<(
     print_bullet("Choose optional network tools to enable.");
     print_bullet("Core local tools stay enabled (shell, file_read/file_write, memory_*).");
 
+    let browser_runtime = detect_browser_runtime_availability();
+    let rust_native_backend_ready =
+        browser_runtime.rust_native_compiled && browser_runtime.docker_webdriver_available;
+    if browser_runtime.in_container
+        && !browser_runtime.brave_available
+        && !browser_runtime.agent_browser_available
+        && !browser_runtime.local_computer_use_available
+        && !rust_native_backend_ready
+    {
+        println!();
+        print_bullet("Browser preflight: no local browser backend detected in this container.");
+        print_bullet("browser_open requires Brave/Brave Browser binary.");
+        print_bullet(
+            "browser backend requires agent-browser CLI or reachable computer_use sidecar.",
+        );
+        if browser_runtime.docker_webdriver_url.is_some() && !browser_runtime.rust_native_compiled {
+            print_bullet(
+                "This binary was not built with browser-native, so WebDriver cannot be used.",
+            );
+        }
+        print_bullet(
+            "You can still enable browser now, but calls will fail until backend setup is done.",
+        );
+    }
+
     let mut browser_config = BrowserConfig::default();
     let enable_browser = Confirm::new()
         .with_prompt("  Enable browser tools (browser_open + browser)?")
@@ -2768,25 +2794,150 @@ fn setup_tool_mode() -> Result<(
             style(browser_config.allowed_domains.join(", ")).green()
         );
 
-        let enable_computer_use = Confirm::new()
-            .with_prompt("  Enable browser.computer_use backend?")
-            .default(false)
-            .interact()?;
+        let mut backend_configured = false;
+        if let Some(webdriver_url) = browser_runtime.docker_webdriver_url.as_deref() {
+            if browser_runtime.rust_native_compiled {
+                let use_rust_native = Confirm::new()
+                    .with_prompt(format!(
+                        "  Use rust_native backend with provisioned WebDriver ({webdriver_url})?"
+                    ))
+                    .default(browser_runtime.docker_webdriver_available)
+                    .interact()?;
+                if use_rust_native {
+                    browser_config.backend = "rust_native".to_string();
+                    browser_config.native_webdriver_url = webdriver_url.to_string();
+                    backend_configured = true;
+                    println!(
+                        "  {} browser backend: {}",
+                        style("✓").green().bold(),
+                        style("rust_native").green()
+                    );
+                    if browser_runtime.docker_webdriver_available {
+                        println!(
+                            "  {} rust-native webdriver endpoint: {}",
+                            style("✓").green().bold(),
+                            style("reachable").green()
+                        );
+                    } else {
+                        println!(
+                            "  {} rust-native webdriver endpoint: {}",
+                            style("!").yellow().bold(),
+                            style("unreachable right now").yellow()
+                        );
+                        print_bullet(
+                            "Browser automation will fail until the configured WebDriver endpoint is reachable.",
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "  {} browser-native build feature: {}",
+                    style("!").yellow().bold(),
+                    style("not enabled in this binary").yellow()
+                );
+                print_bullet(
+                    "A Docker WebDriver sidecar is configured, but this build cannot use rust_native backend.",
+                );
+            }
+        }
 
-        if enable_computer_use {
-            browser_config.backend = "computer_use".to_string();
+        if !backend_configured {
+            let enable_computer_use = Confirm::new()
+                .with_prompt("  Enable browser.computer_use backend?")
+                .default(false)
+                .interact()?;
+
+            if enable_computer_use {
+                browser_config.backend = "computer_use".to_string();
+                let endpoint: String = Input::new()
+                    .with_prompt("  browser.computer_use endpoint")
+                    .default(browser_config.computer_use.endpoint.clone())
+                    .interact_text()?;
+                let endpoint = endpoint.trim();
+                if !endpoint.is_empty() {
+                    browser_config.computer_use.endpoint = endpoint.to_string();
+                }
+                let allow_remote_endpoint = Confirm::new()
+                    .with_prompt("  Allow remote computer_use endpoint?")
+                    .default(browser_config.computer_use.allow_remote_endpoint)
+                    .interact()?;
+                browser_config.computer_use.allow_remote_endpoint = allow_remote_endpoint;
+                println!(
+                    "  {} browser.computer_use: {}",
+                    style("✓").green().bold(),
+                    style("enabled").green()
+                );
+                print_bullet(&format!(
+                    "computer_use endpoint: {}",
+                    browser_config.computer_use.endpoint
+                ));
+                if endpoint_is_reachable(
+                    &browser_config.computer_use.endpoint,
+                    Duration::from_millis(600),
+                ) {
+                    println!(
+                        "  {} computer_use sidecar endpoint: {}",
+                        style("✓").green().bold(),
+                        style("reachable").green()
+                    );
+                } else {
+                    println!(
+                        "  {} computer_use sidecar endpoint: {}",
+                        style("!").yellow().bold(),
+                        style("unreachable right now").yellow()
+                    );
+                    print_bullet(
+                        "Browser automation will fail until the configured computer_use sidecar is reachable.",
+                    );
+                }
+            } else {
+                println!(
+                    "  {} browser backend: {}",
+                    style("✓").green().bold(),
+                    style(browser_config.backend.as_str()).green()
+                );
+                if !browser_runtime.agent_browser_available {
+                    println!(
+                        "  {} agent-browser CLI: {}",
+                        style("!").yellow().bold(),
+                        style("not detected").yellow()
+                    );
+                    print_bullet(
+                        "browser backend is set to agent_browser, but the CLI is unavailable in this environment.",
+                    );
+                }
+            }
+        }
+
+        if !browser_runtime.brave_available {
             println!(
-                "  {} browser.computer_use: {}",
-                style("✓").green().bold(),
-                style("enabled").green()
+                "  {} browser_open executable: {}",
+                style("!").yellow().bold(),
+                style("Brave not detected").yellow()
             );
-            print_bullet("Uses default sidecar endpoint (http://127.0.0.1:8787/v1/actions).");
-        } else {
+            print_bullet("browser_open requires Brave Browser in PATH.");
+        }
+
+        let browser_backend_ready =
+            browser_backend_looks_available(&browser_config, &browser_runtime);
+        let browser_open_ready = browser_runtime.brave_available;
+        if !browser_backend_ready && !browser_open_ready {
             println!(
-                "  {} browser backend: {}",
-                style("✓").green().bold(),
-                style(browser_config.backend.as_str()).green()
+                "  {} Browser tools enabled but no working backend detected in this environment.",
+                style("!").yellow().bold()
             );
+            let keep_enabled = Confirm::new()
+                .with_prompt("  Keep browser tools enabled anyway?")
+                .default(false)
+                .interact()?;
+            if !keep_enabled {
+                browser_config = BrowserConfig::default();
+                println!(
+                    "  {} browser tools: {}",
+                    style("✓").green().bold(),
+                    style("disabled").dim()
+                );
+            }
         }
     } else {
         println!(
@@ -2908,6 +3059,119 @@ fn setup_tool_mode() -> Result<(
         http_request_config,
         web_search_config,
     ))
+}
+
+#[derive(Debug, Clone)]
+struct BrowserRuntimeAvailability {
+    brave_available: bool,
+    agent_browser_available: bool,
+    local_computer_use_available: bool,
+    rust_native_compiled: bool,
+    docker_webdriver_url: Option<String>,
+    docker_webdriver_available: bool,
+    in_container: bool,
+}
+
+fn detect_browser_runtime_availability() -> BrowserRuntimeAvailability {
+    let docker_webdriver_url = docker_webdriver_url_from_env();
+    let docker_webdriver_available = docker_webdriver_url
+        .as_deref()
+        .is_some_and(|url| endpoint_is_reachable(url, Duration::from_millis(600)));
+
+    BrowserRuntimeAvailability {
+        brave_available: command_available("brave-browser", &["--version"])
+            || command_available("brave", &["--version"]),
+        agent_browser_available: command_available("agent-browser", &["--version"]),
+        local_computer_use_available: endpoint_is_reachable(
+            "http://127.0.0.1:8787/v1/actions",
+            Duration::from_millis(600),
+        ),
+        rust_native_compiled: cfg!(feature = "browser-native"),
+        docker_webdriver_url,
+        docker_webdriver_available,
+        in_container: Path::new("/.dockerenv").exists()
+            || std::env::var_os("ZEROCLAW_DOCKER_BOOTSTRAP").is_some(),
+    }
+}
+
+fn docker_webdriver_url_from_env() -> Option<String> {
+    std::env::var("ZEROCLAW_DOCKER_WEBDRIVER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn command_available(command: &str, args: &[&str]) -> bool {
+    std::process::Command::new(command)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn endpoint_is_reachable(endpoint: &str, timeout: Duration) -> bool {
+    let parsed = match reqwest::Url::parse(endpoint) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+
+    let host = match parsed.host_str() {
+        Some(host) if !host.is_empty() => host.to_string(),
+        _ => return false,
+    };
+
+    let port = match parsed.port_or_known_default() {
+        Some(port) => port,
+        None => return false,
+    };
+
+    let addrs = match (host.as_str(), port).to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return false,
+    };
+
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn browser_backend_looks_available(
+    browser_config: &BrowserConfig,
+    runtime: &BrowserRuntimeAvailability,
+) -> bool {
+    let rust_native_ready = runtime.rust_native_compiled
+        && endpoint_is_reachable(
+            &browser_config.native_webdriver_url,
+            Duration::from_millis(600),
+        );
+
+    match browser_config.backend.trim().to_ascii_lowercase().as_str() {
+        "computer_use" | "computeruse" => endpoint_is_reachable(
+            &browser_config.computer_use.endpoint,
+            Duration::from_millis(600),
+        ),
+        "agent_browser" | "agentbrowser" => runtime.agent_browser_available,
+        "auto" => {
+            runtime.agent_browser_available
+                || endpoint_is_reachable(
+                    &browser_config.computer_use.endpoint,
+                    Duration::from_millis(600),
+                )
+                || rust_native_ready
+        }
+        "rust_native" | "native" => rust_native_ready,
+        _ => false,
+    }
 }
 
 fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
